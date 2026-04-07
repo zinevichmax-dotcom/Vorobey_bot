@@ -15,6 +15,22 @@ from docx import Document
 
 STORE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "compliance_docs"))
 
+DOC_TYPE_LABELS: dict[str, str] = {
+    "fz_208": "ФЗ-208",
+    "fz_14": "ФЗ-14",
+    "charter": "Устав",
+    "corporate_agreement": "Корпоративный договор",
+}
+
+VALID_DOC_TYPES: tuple[str, ...] = ("fz_208", "fz_14", "charter", "corporate_agreement")
+
+# Проходы compliance проверки: какие НПА сравниваем с проверяемым документом
+PASS_GROUPS: dict[int, tuple[str, ...]] = {
+    1: ("fz_208",),
+    2: ("fz_14", "charter"),
+    3: ("corporate_agreement",),
+}
+
 
 def init_store():
     """Создаёт папку хранилища если нет."""
@@ -26,7 +42,7 @@ def init_store():
 def upload_regulatory_doc(docx_path: str, doc_type: str, doc_name: str) -> dict:
     """
     Загружает нормативный документ в хранилище.
-    doc_type: "federal_law" | "charter" | "corporate_agreement"
+    doc_type: "fz_208" | "fz_14" | "charter" | "corporate_agreement"
     """
     init_store()
 
@@ -40,6 +56,7 @@ def upload_regulatory_doc(docx_path: str, doc_type: str, doc_name: str) -> dict:
     # Сохраняем метаданные
     meta = {
         "doc_type": doc_type,
+        "doc_type_label": DOC_TYPE_LABELS.get(doc_type, doc_type),
         "doc_name": doc_name,
         "file_hash": file_hash,
         "paragraphs": len(text),
@@ -78,6 +95,21 @@ def get_regulatory_texts() -> dict:
                 docs[doc_type] = json.load(f)
 
     return docs
+
+
+def get_docs_for_pass(pass_num: int) -> dict:
+    """
+    Возвращает загруженные документы, которые участвуют в указанном проходе.
+    {
+        "<doc_type>": {"meta": {...}, "text": [...]},
+        ...
+    }
+    """
+    docs = get_regulatory_texts()
+    allowed = set(PASS_GROUPS.get(pass_num, ()))
+    if not allowed:
+        return {}
+    return {dtype: data for dtype, data in docs.items() if dtype in allowed}
 
 
 def get_regulatory_summary() -> list:
