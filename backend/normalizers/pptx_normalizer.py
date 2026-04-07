@@ -1,200 +1,257 @@
 """
-Нормализатор PPTX: берёт существующий файл и выравнивает.
-- Единые шрифты
-- Единые размеры заголовков/тела
-- Единая цветовая палитра
-- Выравнивание позиций по сетке
-- Единые отступы
+Умный нормализатор PPTX v2.
+Определяет «родной» стиль презентации и сбрасывает только аномалии.
+
+Ключевое: учитывает тему (None = наследование от темы).
+Если 90%+ runs наследуют стиль — любой явный шрифт с малой частотой = аномалия.
 """
-
-from __future__ import annotations
-
 from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
-from pptx.util import Inches, Pt
+from collections import Counter
+import json
 
 
-# === КОНФИГ СТИЛЯ ===
-# Заказчик может потом заменить на свои корпоративные
-STYLE: dict = {
-    # Шрифты
-    "font_title": "Calibri",
-    "font_body": "Calibri",
-
-    # Размеры (Pt)
-    "size_title": Pt(28),
-    "size_subtitle": Pt(18),
-    "size_body": Pt(14),
-    "size_caption": Pt(11),
-
-    # Цвета
-    "color_title": RGBColor(0x1A, 0x1A, 0x2E),  # тёмно-синий
-    "color_body": RGBColor(0x33, 0x33, 0x33),  # тёмно-серый
-    "color_accent": RGBColor(0x2E, 0x75, 0xB6),  # синий акцент
-
-    # Отступы от краёв слайда (EMU)
-    "margin_left": Inches(0.8),
-    "margin_top_title": Inches(0.6),
-    "margin_top_body": Inches(1.8),
-    "content_width": Inches(8.4),  # для 10" слайда
-
-    # Межстрочный интервал
-    "line_spacing": Pt(20),
-}
-
-
-def normalize_pptx(input_path: str, output_path: str, style: dict | None = None) -> dict:
+def normalize_pptx(input_path: str, output_path: str) -> dict:
     """
-    Нормализует презентацию.
-    Возвращает отчёт: что изменено.
+    Нормализует PPTX: исправляет аномалии, сохраняет авторский стиль.
     """
-    if style is None:
-        style = STYLE
-
     prs = Presentation(input_path)
-    report: dict = {"slides_processed": 0, "changes": []}
 
-    for i, slide in enumerate(prs.slides):
-        slide_changes: list[str] = []
+    # Проход 1: статистика
+    stats = _collect_stats(prs)
 
-        for shape in slide.shapes:
-            # --- Нормализация текста ---
-            if shape.has_text_frame:
-                shape_type = _classify_shape(shape)
+    # Определяем норму
+    norm = _define_norm(stats)
 
-                for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
-                        slide_changes.extend(_normalize_run(run, shape_type, style))
-
-                # Выравнивание позиции шейпа
-                slide_changes.extend(_normalize_position(shape, shape_type, style))
-
-            # --- Нормализация таблиц ---
-            if shape.has_table:
-                slide_changes.extend(_normalize_table(shape, style))
-
-        if slide_changes:
-            report["changes"].append({"slide": i + 1, "changes": slide_changes})
-        report["slides_processed"] = i + 1
+    # Проход 2: фиксим
+    fixes = _fix_anomalies(prs, norm)
 
     prs.save(output_path)
-    return report
 
-
-def _classify_shape(shape) -> str:
-    """Определяет роль текстового блока."""
-    name = (shape.name or "").lower()
-    if "title" in name:
-        return "title"
-    if "subtitle" in name:
-        return "subtitle"
-
-    # Эвристика: если текст крупный и короткий — заголовок
-    if shape.has_text_frame:
-        text = (shape.text_frame.text or "").strip()
-        if len(text) < 80 and shape.top < Inches(2):
-            return "title"
-
-    return "body"
-
-
-def _normalize_run(run, shape_type: str, style: dict) -> list[str]:
-    """Нормализует один run текста. Возвращает список изменений."""
-    changes: list[str] = []
-
-    # Шрифт
-    target_font = style["font_title"] if shape_type == "title" else style["font_body"]
-    if run.font.name != target_font:
-        old = run.font.name
-        run.font.name = target_font
-        changes.append(f"font: {old} → {target_font}")
-
-    # Размер
-    size_map = {
-        "title": style["size_title"],
-        "subtitle": style["size_subtitle"],
-        "body": style["size_body"],
-        "caption": style["size_caption"],
+    return {
+        "stats": {
+            "slides": len(prs.slides),
+            "total_runs": stats["total_runs"],
+            "inherited_font_runs": stats["inherited_fonts"],
+            "explicit_font_runs": stats["explicit_fonts"],
+            "inherited_size_runs": stats["inherited_sizes"],
+            "explicit_size_runs": stats["explicit_sizes"],
+            "fonts_found": dict(stats["fonts"]),
+            "sizes_found_pt": dict(stats["sizes_pt"]),
+        },
+        "norm": norm,
+        "fixes": fixes,
+        "total_fixes": len(fixes),
     }
-    target_size = size_map.get(shape_type, style["size_body"])
-    if run.font.size != target_size:
-        old = run.font.size
-        run.font.size = target_size
-        changes.append(f"size: {old} → {target_size}")
-
-    # Цвет
-    target_color = style["color_title"] if shape_type == "title" else style["color_body"]
-    try:
-        current = run.font.color.rgb
-        if current != target_color:
-            run.font.color.rgb = target_color
-            changes.append(f"color: {current} → {target_color}")
-    except Exception:
-        run.font.color.rgb = target_color
-        changes.append(f"color: set → {target_color}")
-
-    return changes
 
 
-def _normalize_position(shape, shape_type: str, style: dict) -> list[str]:
-    """Выравнивает позицию шейпа по сетке."""
-    changes: list[str] = []
+def _collect_stats(prs) -> dict:
+    """Проход 1: частотность + соотношение inherited/explicit."""
+    fonts = Counter()
+    sizes_pt = Counter()
+    colors = Counter()
+    total_runs = 0
+    inherited_fonts = 0
+    explicit_fonts = 0
+    inherited_sizes = 0
+    explicit_sizes = 0
 
-    if shape_type == "title":
-        target_left = style["margin_left"]
-        target_top = style["margin_top_title"]
-        target_width = style["content_width"]
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            frames = []
+            if shape.has_text_frame:
+                frames.append(shape.text_frame)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        frames.append(cell.text_frame)
 
-        if abs(shape.left - target_left) > Inches(0.2):
-            shape.left = target_left
-            changes.append("title: aligned left")
-        if abs(shape.top - target_top) > Inches(0.3):
-            shape.top = target_top
-            changes.append("title: aligned top")
-        if abs(shape.width - target_width) > Inches(0.5):
-            shape.width = target_width
-            changes.append("title: width normalized")
+            for tf in frames:
+                for para in tf.paragraphs:
+                    for run in para.runs:
+                        if not run.text.strip():
+                            continue
+                        total_runs += 1
 
-    elif shape_type == "body":
-        target_left = style["margin_left"]
-        target_width = style["content_width"]
+                        # Шрифты
+                        if run.font.name:
+                            explicit_fonts += 1
+                            fonts[run.font.name] += 1
+                        else:
+                            inherited_fonts += 1
 
-        if abs(shape.left - target_left) > Inches(0.3):
-            shape.left = target_left
-            changes.append("body: aligned left")
-        if abs(shape.width - target_width) > Inches(0.5):
-            shape.width = target_width
-            changes.append("body: width normalized")
+                        # Размеры
+                        if run.font.size:
+                            explicit_sizes += 1
+                            pt = round(run.font.size / 12700, 1)
+                            sizes_pt[pt] += 1
+                        else:
+                            inherited_sizes += 1
 
-    return changes
+                        # Цвета
+                        try:
+                            if run.font.color and run.font.color.rgb:
+                                colors[str(run.font.color.rgb)] += 1
+                        except Exception:
+                            pass
+
+    return {
+        "fonts": fonts,
+        "sizes_pt": sizes_pt,
+        "colors": colors,
+        "total_runs": total_runs,
+        "inherited_fonts": inherited_fonts,
+        "explicit_fonts": explicit_fonts,
+        "inherited_sizes": inherited_sizes,
+        "explicit_sizes": explicit_sizes,
+    }
 
 
-def _normalize_table(shape, style: dict) -> list[str]:
-    """Нормализует таблицу: шрифты, размеры."""
-    table = shape.table
+def _define_norm(stats: dict) -> dict:
+    """
+    Определяет норму. Два режима:
 
-    for row in table.rows:
-        for cell in row.cells:
-            for para in cell.text_frame.paragraphs:
-                for run in para.runs:
-                    if run.font.name != style["font_body"]:
-                        run.font.name = style["font_body"]
-                    if run.font.size != style["size_body"]:
-                        run.font.size = style["size_body"]
-                    run.font.color.rgb = style["color_body"]
+    A) Тема доминирует (>70% inherited) → любой явный шрифт с count < 3 = аномалия
+    B) Явные шрифты доминируют → классика: топ шрифты = норма, редкие = аномалия
+    """
+    fonts = stats["fonts"]
+    sizes_pt = stats["sizes_pt"]
+    total = stats["total_runs"]
+    inherited_fonts = stats["inherited_fonts"]
+    explicit_fonts = stats["explicit_fonts"]
+    inherited_sizes = stats["inherited_sizes"]
+    explicit_sizes = stats["explicit_sizes"]
 
-    return ["table: fonts and colors normalized"]
+    # --- Режим шрифтов ---
+    if total > 0 and inherited_fonts / total > 0.7:
+        font_mode = "theme_dominant"
+        # Тема доминирует: родные = шрифты с count >= 5 ИЛИ >= 10% от explicit
+        threshold = max(3, explicit_fonts * 0.1) if explicit_fonts > 0 else 3
+        native_fonts = [f for f, c in fonts.items() if c >= threshold]
+    else:
+        font_mode = "explicit_dominant"
+        # Явные доминируют: топ-5 + всё что >= 3
+        native_fonts = list(
+            set([f for f, _ in fonts.most_common(5)] + [f for f, c in fonts.items() if c >= 3])
+        )
+
+    # --- Режим размеров ---
+    if total > 0 and inherited_sizes / total > 0.7:
+        size_mode = "theme_dominant"
+        # Тема доминирует: любой явный размер с count < 2 подозрителен
+        # Но нужен контекст — если размер в разумном диапазоне, оставляем
+        common_sizes = [s for s, c in sizes_pt.items() if c >= 2]
+        if common_sizes:
+            size_range = (min(common_sizes) * 0.7, max(common_sizes) * 1.3)
+        else:
+            # Нет common sizes — используем абсолютный диапазон
+            size_range = (8.0, 60.0)
+        # Одиночные размеры вне диапазона = аномалия
+    else:
+        size_mode = "explicit_dominant"
+        common_sizes = [s for s, c in sizes_pt.items() if c >= 2]
+        if not common_sizes and sizes_pt:
+            common_sizes = list(sizes_pt.keys())
+        if common_sizes:
+            margin = max((max(common_sizes) - min(common_sizes)) * 0.3, 4)
+            size_range = (max(min(common_sizes) - margin, 6), max(common_sizes) + margin)
+        else:
+            size_range = (8.0, 60.0)
+
+    return {
+        "font_mode": font_mode,
+        "native_fonts": native_fonts,
+        "size_mode": size_mode,
+        "size_range_pt": [round(size_range[0], 1), round(size_range[1], 1)],
+        "font_anomaly_rule": (
+            "explicit font with count < threshold → reset to theme"
+            if font_mode == "theme_dominant"
+            else "font not in native list → reset to theme"
+        ),
+        "size_anomaly_rule": (f"explicit size outside {size_range[0]:.0f}-{size_range[1]:.0f}pt → reset"),
+    }
 
 
+def _fix_anomalies(prs, norm: dict) -> list:
+    """Проход 2: исправляет аномалии."""
+    fixes = []
+    native_fonts = set(norm["native_fonts"])
+    min_pt, max_pt = norm["size_range_pt"]
+    font_mode = norm["font_mode"]
+
+    for i, slide in enumerate(prs.slides):
+        for shape in slide.shapes:
+            frames = []
+            if shape.has_text_frame:
+                frames.append(("shape", shape.name, shape.text_frame))
+            if shape.has_table:
+                for ri, row in enumerate(shape.table.rows):
+                    for ci, cell in enumerate(row.cells):
+                        frames.append(("table", f"{shape.name}[{ri}][{ci}]", cell.text_frame))
+
+            for source, name, tf in frames:
+                for para in tf.paragraphs:
+                    for run in para.runs:
+                        text = run.text.strip()
+                        if not text:
+                            continue
+                        preview = text[:40]
+
+                        # --- Шрифт ---
+                        if run.font.name:
+                            is_alien = False
+                            if font_mode == "theme_dominant":
+                                # В теме: любой явный шрифт не в native = аномалия
+                                is_alien = run.font.name not in native_fonts
+                            else:
+                                # Явные: шрифт не в native = аномалия
+                                is_alien = native_fonts and run.font.name not in native_fonts
+
+                            if is_alien:
+                                fixes.append(
+                                    {
+                                        "slide": i + 1,
+                                        "element": name,
+                                        "type": "alien_font",
+                                        "was": run.font.name,
+                                        "action": "reset to theme",
+                                        "text": preview,
+                                    }
+                                )
+                                run.font.name = None
+
+                        # --- Размер ---
+                        if run.font.size:
+                            pt = round(run.font.size / 12700, 1)
+                            if pt < min_pt or pt > max_pt:
+                                fixes.append(
+                                    {
+                                        "slide": i + 1,
+                                        "element": name,
+                                        "type": "abnormal_size",
+                                        "was_pt": pt,
+                                        "allowed_range": [min_pt, max_pt],
+                                        "action": "reset to theme",
+                                        "text": preview,
+                                    }
+                                )
+                                run.font.size = None
+
+    return fixes
+
+
+# === CLI ===
 if __name__ == "__main__":
-    import json
     import sys
 
-    if len(sys.argv) > 1:
-        input_file = sys.argv[1]
-        output_file = sys.argv[1].replace(".pptx", "_normalized.pptx")
-        report = normalize_pptx(input_file, output_file)
-        print(json.dumps(report, indent=2, default=str, ensure_ascii=False))
-        print(f"\nСохранено: {output_file}")
-    else:
-        print("Использование: python pptx_normalizer.py файл.pptx")
+    if len(sys.argv) < 2:
+        print("Использование: python pptx_normalizer.py файл.pptx [output.pptx]")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else input_file.replace(".pptx", "_normalized.pptx")
+
+    report = normalize_pptx(input_file, output_file)
+    print(json.dumps(report, indent=2, default=str, ensure_ascii=False))
+    print(f"\nСохранено: {output_file}")
