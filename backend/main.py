@@ -9,10 +9,13 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
 from ai.agreement_generator import generate_supplement_agreement
 from builders.agreement_builder import build_agreement_docx
@@ -20,11 +23,25 @@ from builders.compliance_report_builder import build_compliance_report
 from builders.diff_report_builder import build_diff_report
 from compliance.compliance_checker import check_compliance
 from compliance.document_store import VALID_DOC_TYPES, get_regulatory_summary, upload_regulatory_doc
+from integrations.egrul import find_by_inn_or_ogrn, get_persons_recursive, search_by_name
+from integrations.interest_detector import detect_interest
 from normalizers.pptx_normalizer import normalize_pptx
 from parsers.docx_diff import compare_documents
 from parsers.docx_track_changes import extract_track_changes, filter_significant_changes
 
+load_dotenv()
+
 app = FastAPI(title="Vorobey Bot — Document Normalizer")
+
+
+class InterestCheckRequest(BaseModel):
+    inn_a: str
+    inn_b: str
+    board_members_a: Optional[list[str]] = None
+    board_members_b: Optional[list[str]] = None
+    management_board_a: Optional[list[str]] = None
+    management_board_b: Optional[list[str]] = None
+    related_persons: Optional[list[dict]] = None
 
 # CORS для фронтенда
 app.add_middleware(
@@ -266,3 +283,67 @@ async def check_compliance_endpoint(
         filename=f"compliance_{file.filename}",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+
+@app.get("/egrul/by-inn/{inn}")
+async def egrul_by_inn(inn: str):
+    """Данные организации по ИНН/ОГРН."""
+    try:
+        return find_by_inn_or_ogrn(inn)
+    except ValueError as e:
+        raise HTTPException(500, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка ЕГРЮЛ: {str(e)}")
+
+
+@app.get("/egrul/persons/{inn}")
+async def egrul_persons(inn: str, depth: int = 2):
+    """
+    Персоналии организации с раскрытием учредителей-юрлиц.
+    depth: глубина раскрытия (1-3).
+    """
+    if depth > 3:
+        depth = 3
+    try:
+        return get_persons_recursive(inn, depth=depth)
+    except ValueError as e:
+        raise HTTPException(500, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка: {str(e)}")
+
+
+@app.get("/egrul/search")
+async def egrul_search(name: str, count: int = 5):
+    """Поиск организации по названию."""
+    if not name or len(name) < 2:
+        raise HTTPException(400, "Минимум 2 символа")
+    try:
+        return search_by_name(name, min(count, 20))
+    except ValueError as e:
+        raise HTTPException(500, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка: {str(e)}")
+
+
+@app.post("/interest/check")
+async def check_interest(request: InterestCheckRequest):
+    """
+    Проверить сделку на заинтересованность.
+    Подтягивает ЕГРЮЛ обеих сторон + анализирует через Claude.
+    """
+    try:
+        result = detect_interest(
+            inn_a=request.inn_a,
+            inn_b=request.inn_b,
+            board_members_a=request.board_members_a,
+            board_members_b=request.board_members_b,
+            management_board_a=request.management_board_a,
+            management_board_b=request.management_board_b,
+            related_persons=request.related_persons,
+        )
+    except ValueError as e:
+        raise HTTPException(500, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка проверки: {str(e)}")
+
+    return result
