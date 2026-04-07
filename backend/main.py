@@ -16,7 +16,9 @@ from fastapi.responses import FileResponse
 
 from ai.agreement_generator import generate_supplement_agreement
 from builders.agreement_builder import build_agreement_docx
+from builders.diff_report_builder import build_diff_report
 from normalizers.pptx_normalizer import normalize_pptx
+from parsers.docx_diff import compare_documents
 from parsers.docx_track_changes import extract_track_changes, filter_significant_changes
 
 app = FastAPI(title="Vorobey Bot — Document Normalizer")
@@ -130,5 +132,57 @@ async def generate_supplement_endpoint(
     return FileResponse(
         output_path,
         filename=f"supplement_{file.filename}",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+@app.post("/compare/docx")
+async def compare_documents_endpoint(
+    file_a: UploadFile = File(...),
+    file_b: UploadFile = File(...),
+    format: str = "docx",  # "docx" или "json"
+):
+    """
+    Загрузи 2 DOCX файла → получи отчёт о различиях.
+    format=docx → DOCX с выделенными различиями
+    format=json → JSON со списком изменений
+    """
+    if not (file_a.filename or "").endswith(".docx") or not (file_b.filename or "").endswith(".docx"):
+        raise HTTPException(400, "Оба файла должны быть .docx")
+
+    job_id = str(uuid.uuid4())[:8]
+    path_a = os.path.join(UPLOAD_DIR, f"{job_id}_a.docx")
+    path_b = os.path.join(UPLOAD_DIR, f"{job_id}_b.docx")
+    output_path = os.path.join(UPLOAD_DIR, f"{job_id}_diff_report.docx")
+
+    with open(path_a, "wb") as f:
+        shutil.copyfileobj(file_a.file, f)
+    with open(path_b, "wb") as f:
+        shutil.copyfileobj(file_b.file, f)
+
+    # Сравниваем
+    try:
+        diff_result = compare_documents(path_a, path_b)
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка сравнения: {str(e)}")
+
+    # JSON формат
+    if format == "json":
+        return diff_result
+
+    # DOCX формат
+    try:
+        build_diff_report(
+            diff_result,
+            output_path,
+            name_a=file_a.filename,
+            name_b=file_b.filename,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка генерации отчёта: {str(e)}")
+
+    return FileResponse(
+        output_path,
+        filename=f"diff_{file_a.filename}_vs_{file_b.filename}.docx",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
