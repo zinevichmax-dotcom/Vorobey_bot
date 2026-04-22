@@ -7,3 +7,4 @@ python-multipart==0.0.12
 requests==2.32.0
 python-dotenv==1.0.1
 lxml==6.0.2
+Pillow==11.3.0

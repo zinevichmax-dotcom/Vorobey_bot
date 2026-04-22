@@ -109,10 +109,7 @@ def _replace_in_text_elements(slide_elem, replacements: dict):
 def _replace_image_in_slide(slide, image_path: str) -> bool:
     """
     Заменить самую большую картинку на слайде (по площади) на image_path.
-    
-    Таким образом работает и для image_text (placeholder-картинка слева),
-    и для image_full (full-bleed фон).
-    Если image_path пустой/отсутствует — ничего не делаем.
+    Сохраняет aspect ratio исходной картинки, центрует в bounds placeholder'а.
     """
     if not image_path or not os.path.exists(image_path):
         return False
@@ -129,10 +126,32 @@ def _replace_image_in_slide(slide, image_path: str) -> bool:
     if largest is None:
         return False
     
-    left, top, width, height = largest.left, largest.top, largest.width, largest.height
+    ph_left, ph_top = largest.left, largest.top
+    ph_width, ph_height = largest.width, largest.height
+    
+    # Вычислить размеры с сохранением aspect ratio
+    from PIL import Image as PILImage
+    try:
+        with PILImage.open(image_path) as img:
+            img_w, img_h = img.size
+    except Exception:
+        # fallback: без PIL — просто растягиваем как раньше
+        sp = largest._element
+        sp.getparent().remove(sp)
+        slide.shapes.add_picture(image_path, ph_left, ph_top, width=ph_width, height=ph_height)
+        return True
+    
+    # fit inside placeholder, keep ratio
+    scale = min(ph_width / img_w, ph_height / img_h)
+    new_w = int(img_w * scale)
+    new_h = int(img_h * scale)
+    # центровка
+    new_left = ph_left + (ph_width - new_w) // 2
+    new_top = ph_top + (ph_height - new_h) // 2
+    
     sp = largest._element
     sp.getparent().remove(sp)
-    slide.shapes.add_picture(image_path, left, top, width=width, height=height)
+    slide.shapes.add_picture(image_path, new_left, new_top, width=new_w, height=new_h)
     return True
 
 

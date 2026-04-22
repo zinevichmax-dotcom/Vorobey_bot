@@ -53,6 +53,19 @@ CLASSIFIER_SYSTEM_PROMPT = """Ты — helper для редизайна през
 4. Если автор оригинала пишет буллетами/списком — сохрани их как буллеты.
 5. Порядок информации не меняется.
 
+СТРОГО ПРО ЗАГОЛОВКИ TITLE:
+- В layout "title" поле TITLE = исходный заголовок слайда ДОСЛОВНО, буква в букву.
+- Не придумывай новые слова, не сокращай, не переставляй.
+- Если в исходнике перенос строки (\n) или vertical tab (\x0b) внутри заголовка — заменяй их пробелом, но ВСЕ слова сохраняй.
+- Пример правильно: input "ДЕНЬ\nНАРОДНОГО\nЕДИНСТВА" → TITLE "ДЕНЬ НАРОДНОГО ЕДИНСТВА"
+- Пример неправильно: input "ДЕНЬ НАРОДНОГО ЕДИНСТВА" → TITLE "история праздника" (это ВЫДУМКА, запрещено).
+
+РАЗБИВКА ДЛИННЫХ СПИСКОВ:
+- Если видишь нумерованный или маркированный список с 6+ пунктами — НЕ используй text_heavy.
+- Обязательно разбивай на несколько слайдов layout "bullets" по 5 пунктов максимум.
+- Пример: 30 уроков → 6 слайдов bullets по 5 уроков.
+- В HEADING каждого слайда пиши "<Название> (часть N)" или просто повторяй заголовок.
+
 ПРАВИЛА ЗАПОЛНЕНИЯ:
 - Для bullets layout: ВСЕГДА заполняй BULLET_N_NUM = "01", "02", "03", "04", "05" (ровно двузначные).
 - Для неиспользуемых слотов (например только 3 буллета из 5) — не передавай лишние ключи, тогда они не покажутся.
@@ -171,7 +184,21 @@ def classify_slide(slide_info: dict, anthropic_client: Anthropic,
             idx = s["image_index"]
             if idx < len(slide_info.get("images", [])):
                 s["content"]["_image_path"] = slide_info["images"][idx]["path"]
-    
+
+    # Post-check: Claude не должен выдумывать TITLE
+    if is_first:
+        input_title = (slide_info.get("title_candidate") or "").strip()
+        # нормализуем переносы
+        input_title_norm = input_title.replace("\x0b", " ").replace("\n", " ").strip()
+        for s in result.get("slides", []):
+            if s.get("layout_kind") == "title":
+                returned = s.get("content", {}).get("TITLE", "").strip()
+                if returned and input_title_norm and returned.lower() not in input_title_norm.lower():
+                    # Claude выдумал — подменяем на исходный title
+                    s["content"]["TITLE"] = input_title_norm[:30]  # respect limit
+                    if "reasoning" in result:
+                        result["reasoning"] += " [TITLE forced to input]"
+
     return result
 
 
@@ -189,12 +216,18 @@ def classify_presentation(parsed_data: dict, anthropic_client: Anthropic) -> lis
         is_last = slide_info["index"] == parsed_data["total_slides"] - 1
         
         # Специальные случаи — слайды с chart/SmartArt/media оставляем "как есть"
-        if slide_info.get("has_chart") or slide_info.get("has_media"):
+        has_many_images = len(slide_info.get("images", [])) >= 3
+        has_little_text = slide_info.get("total_chars", 0) < 100
+        
+        if (slide_info.get("has_chart") 
+            or slide_info.get("has_media")
+            or slide_info.get("has_smartart")
+            or (has_many_images and has_little_text)):  # ← новое: коллаж
             output_slides.append({
                 "layout_kind": "_original",  # специальный маркер
                 "content": {},
                 "source_slide_idx": slide_info["index"],
-                "reason": "chart/media — preserved",
+                "reason": "chart/media/smartart/image-collage — preserved",
             })
             continue
         
