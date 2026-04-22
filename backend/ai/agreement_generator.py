@@ -91,7 +91,7 @@ def generate_supplement_agreement(
     today = datetime.now().strftime("%d.%m.%Y")
     title = "ДОПОЛНИТЕЛЬНОЕ СОГЛАШЕНИЕ"
     if contract_number:
-        title += f"\nк {contract_name} № {contract_number}"
+        title += f"\nк {_to_dative(contract_name)} № {contract_number}"
     if contract_date:
         title += f" от {contract_date}"
 
@@ -133,4 +133,39 @@ def _format_changes_for_prompt(changes: list) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _to_dative(name: str) -> str:
+    """
+    Склоняет название договора в дательный падеж.
+    'Договор аренды' → 'Договору аренды'.
+    Простое правило: меняем первое слово по таблице, остальное не трогаем.
+    """
+    if not name:
+        return name
+
+    words = name.split()
+    if not words:
+        return name
+
+    first = words[0]
+    first_lower = first.lower()
+
+    # Таблица склонений в дательный падеж
+    dative_map = {
+        "договор": "договору",
+        "соглашение": "соглашению",
+        "контракт": "контракту",
+        "дополнение": "дополнению",
+        "приложение": "приложению",
+    }
+
+    if first_lower in dative_map:
+        replacement = dative_map[first_lower]
+        # Сохраняем регистр: если было с большой буквы — вернём с большой
+        if first[0].isupper():
+            replacement = replacement.capitalize()
+        words[0] = replacement
+
+    return " ".join(words)
 

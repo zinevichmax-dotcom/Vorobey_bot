@@ -61,7 +61,7 @@ export const api = {
 
   /**
    * POST с файлом (multipart).
-   * Возвращает blob (для скачивания) или JSON (если format=json).
+   * Возвращает blob (для скачивания файлов) или JSON (для метаданных).
    */
   async postFile<T>(
     path: string,
@@ -80,6 +80,8 @@ export const api = {
 
       const xhr = new XMLHttpRequest()
       xhr.open("POST", `${API_URL}${path}`)
+      // responseType должен быть выставлен ДО send()
+      xhr.responseType = "blob"
 
       if (onProgress) {
         xhr.upload.addEventListener("progress", (e) => {
@@ -89,28 +91,39 @@ export const api = {
         })
       }
 
-      xhr.onload = () => {
+      xhr.onload = async () => {
         if (xhr.status >= 200 && xhr.status < 300) {
+          const blob = xhr.response as Blob
           const contentType = xhr.getResponseHeader("content-type") || ""
+
           if (contentType.includes("application/json")) {
-            resolve(JSON.parse(xhr.responseText))
+            const text = await blob.text()
+            try {
+              resolve(JSON.parse(text) as T)
+            } catch {
+              reject(new ApiError(0, "Невалидный JSON в ответе"))
+            }
           } else {
-            resolve(xhr.response as T)
+            resolve(blob as T)
           }
         } else {
-          let message = `Ошибка ${xhr.status}`
           try {
-            const data = JSON.parse(xhr.responseText)
-            message = data.detail || message
+            const text = await (xhr.response as Blob).text()
+            let message = `Ошибка ${xhr.status}`
+            try {
+              const data = JSON.parse(text)
+              message = data.detail || message
+            } catch {
+              /* текст не JSON */
+            }
+            reject(new ApiError(xhr.status, message))
           } catch {
-            /* noop */
+            reject(new ApiError(xhr.status, `Ошибка ${xhr.status}`))
           }
-          reject(new ApiError(xhr.status, message))
         }
       }
 
       xhr.onerror = () => reject(new ApiError(0, "Сеть недоступна"))
-      xhr.responseType = "blob"
       xhr.send(formData)
     })
   },

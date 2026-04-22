@@ -22,6 +22,7 @@ from compliance.document_store import (
     get_docs_for_pass,
     get_regulatory_texts,
 )
+from parsers.docx_accept_changes import extract_text_with_accepted_changes
 
 
 def check_compliance(document_path: str) -> dict:
@@ -46,14 +47,23 @@ def check_compliance(document_path: str) -> dict:
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
     # === ТРИ ПРОХОДА ===
-    pass_results: list[dict] = []
-
+    pass_results = []
     for pass_num in sorted(PASS_GROUPS.keys()):
         pass_docs = get_docs_for_pass(pass_num)
         if not pass_docs:
             continue
 
-        result = _run_pass(client, pass_num, pass_docs, doc_text)
+        # Оценка токенов: суммарно НПА + документ + промпт
+        total_chars = sum(len("\n".join(d["text"])) for d in pass_docs.values())
+        total_chars += len(doc_text) + 5000  # +запас на промпт и output
+        approx_tokens = total_chars // 3
+
+        # Если прохода > 190K токенов (с запасом) — чанкуем на 2
+        if approx_tokens > 190000:
+            result = _run_pass_chunked(client, pass_num, pass_docs, doc_text, chunks=2)
+        else:
+            result = _run_pass(client, pass_num, pass_docs, doc_text)
+
         pass_results.append(result)
 
     # === MERGE ===
@@ -153,6 +163,47 @@ def _run_pass(client, pass_num: int, pass_docs: dict, doc_text: str) -> dict:
             "violations": [],
             "notes": [f"Ошибка API при проходе {pass_num}: {str(e)}"],
         }
+
+
+def _run_pass_chunked(client, pass_num: int, pass_docs: dict, doc_text: str, chunks: int = 2) -> dict:
+    """
+    Выполняет проход частями если НПА не влезает в контекст.
+    Делит текст каждого НПА на N частей → N проходов → merge нарушений.
+    """
+    # Создаём копии документов для каждого чанка
+    all_violations = []
+    all_notes = []
+    all_docs_checked = []
+
+    for chunk_idx in range(chunks):
+        chunked_docs = {}
+        for doc_type, data in pass_docs.items():
+            text_list = data["text"]
+            chunk_size = len(text_list) // chunks
+            start = chunk_idx * chunk_size
+            end = start + chunk_size if chunk_idx < chunks - 1 else len(text_list)
+
+            chunked_docs[doc_type] = {
+                "meta": {
+                    **data["meta"],
+                    "doc_name": f"{data['meta']['doc_name']} (часть {chunk_idx + 1}/{chunks})",
+                },
+                "text": text_list[start:end],
+            }
+
+        chunk_result = _run_pass(client, pass_num, chunked_docs, doc_text)
+        all_violations.extend(chunk_result.get("violations", []))
+        all_notes.extend(chunk_result.get("notes", []))
+        if chunk_idx == 0:
+            all_docs_checked = chunk_result.get("regulatory_docs_checked", [])
+
+    return {
+        "pass_num": pass_num,
+        "regulatory_docs_checked": all_docs_checked,
+        "violations": all_violations,
+        "notes": all_notes,
+        "chunked": chunks,
+    }
 
 
 def _merge_results(client, pass_results: list, doc_text: str) -> dict:
@@ -256,23 +307,21 @@ def _generate_summary(violations: list, docs_checked: list) -> str:
 
 
 def _extract_document_text(document_path: str) -> str:
-    """Извлекает текст из проверяемого документа (DOCX или ODT)."""
+    """Извлекает текст проверяемого документа с применёнными Track Changes."""
     ext = os.path.splitext(document_path)[1].lower()
 
     if ext == ".docx":
-        doc = Document(document_path)
-        paragraphs: list[str] = []
-        for para in doc.paragraphs:
-            if para.text.strip():
-                paragraphs.append(para.text.strip())
-        for table in doc.tables:
-            for row in table.rows:
-                row_texts = [c.text.strip() for c in row.cells if c.text.strip()]
-                if row_texts:
-                    paragraphs.append(" | ".join(row_texts))
-        return "\n".join(paragraphs)
+        try:
+            return extract_text_with_accepted_changes(document_path)
+        except Exception:
+            # Fallback: обычное извлечение через python-docx
+            from docx import Document
 
-    if ext == ".odt":
+            doc = Document(document_path)
+            paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            return "\n".join(paragraphs)
+
+    elif ext == ".odt":
         import zipfile
         import xml.etree.ElementTree as ET
 
@@ -280,7 +329,7 @@ def _extract_document_text(document_path: str) -> str:
             with z.open("content.xml") as f:
                 tree = ET.parse(f)
         root = tree.getroot()
-        texts: list[str] = []
+        texts = []
         for elem in root.iter():
             if elem.text and elem.text.strip():
                 texts.append(elem.text.strip())

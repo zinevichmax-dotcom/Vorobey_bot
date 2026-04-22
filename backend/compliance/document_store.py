@@ -31,6 +31,43 @@ PASS_GROUPS: dict[int, tuple[str, ...]] = {
     3: ("corporate_agreement",),
 }
 
+def _approx_tokens_from_text(paragraphs: list[str]) -> int:
+    """
+    Грубая оценка токенов: ~4 символа на токен для кириллицы/латиницы.
+    Используется только для контроля лимитов контекста.
+    """
+    char_count = sum(len(p) for p in paragraphs)
+    return max(0, int(char_count / 4))
+
+
+def get_total_tokens() -> dict:
+    """
+    Считает примерный токен-бюджет по проходам compliance.
+    Возвращает структуру:
+    {
+        "passes": { "1": {"total_tokens": int, "fits_200k": bool}, ... },
+        "total": int
+    }
+    """
+    docs = get_regulatory_texts()
+    passes: dict[str, dict] = {}
+    total = 0
+
+    for pass_num, doc_types in PASS_GROUPS.items():
+        pass_tokens = 0
+        for doc_type in doc_types:
+            data = docs.get(doc_type)
+            if not data:
+                continue
+            pass_tokens += _approx_tokens_from_text(data.get("text", []))
+        passes[str(pass_num)] = {
+            "total_tokens": pass_tokens,
+            "fits_200k": pass_tokens <= 200_000,
+        }
+        total += pass_tokens
+
+    return {"passes": passes, "total": total}
+
 
 def init_store():
     """Создаёт папку хранилища если нет."""
@@ -39,18 +76,24 @@ def init_store():
     os.makedirs(os.path.join(STORE_DIR, "extracted"), exist_ok=True)
 
 
-def upload_regulatory_doc(docx_path: str, doc_type: str, doc_name: str) -> dict:
+def upload_regulatory_doc(file_path: str, doc_type: str, doc_name: str) -> dict:
     """
     Загружает нормативный документ в хранилище.
     doc_type: "fz_208" | "fz_14" | "charter" | "corporate_agreement"
+    Поддерживает .docx и .odt.
     """
     init_store()
 
-    # Извлекаем текст
-    text = _extract_text(docx_path)
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".docx":
+        text = _extract_text_docx(file_path)
+    elif ext == ".odt":
+        text = _extract_text_odt(file_path)
+    else:
+        raise ValueError(f"Неподдерживаемый формат: {ext}")
 
     # Считаем хеш для дедупликации
-    with open(docx_path, "rb") as f:
+    with open(file_path, "rb") as f:
         file_hash = hashlib.md5(f.read()).hexdigest()[:12]
 
     # Сохраняем метаданные
@@ -62,6 +105,7 @@ def upload_regulatory_doc(docx_path: str, doc_type: str, doc_name: str) -> dict:
         "paragraphs": len(text),
         "char_count": sum(len(t) for t in text),
     }
+    meta["file_format"] = ext
 
     # Сохраняем извлечённый текст
     text_path = os.path.join(STORE_DIR, "extracted", f"{doc_type}.json")
@@ -69,8 +113,8 @@ def upload_regulatory_doc(docx_path: str, doc_type: str, doc_name: str) -> dict:
         json.dump({"meta": meta, "text": text}, f, ensure_ascii=False, indent=2)
 
     # Копируем оригинал
-    orig_path = os.path.join(STORE_DIR, "originals", f"{doc_type}.docx")
-    shutil.copy2(docx_path, orig_path)
+    orig_path = os.path.join(STORE_DIR, "originals", f"{doc_type}{ext}")
+    shutil.copy2(file_path, orig_path)
 
     return meta
 
@@ -126,7 +170,7 @@ def get_regulatory_summary() -> list:
     ]
 
 
-def _extract_text(docx_path: str) -> list[str]:
+def _extract_text_docx(docx_path: str) -> list[str]:
     """Извлекает текст из DOCX по абзацам."""
     doc = Document(docx_path)
     paragraphs: list[str] = []
@@ -145,6 +189,41 @@ def _extract_text(docx_path: str) -> list[str]:
                     row_texts.append(cell.text.strip())
             if row_texts:
                 paragraphs.append(" | ".join(row_texts))
+
+    return paragraphs
+
+
+def _extract_text_odt(odt_path: str) -> list[str]:
+    """Извлекает текст из ODT (OpenDocument). ODT = ZIP с XML внутри."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(odt_path, "r") as z:
+        with z.open("content.xml") as f:
+            tree = ET.parse(f)
+
+    root = tree.getroot()
+    texts = []
+    for elem in root.iter():
+        if elem.text and elem.text.strip():
+            texts.append(elem.text.strip())
+        if elem.tail and elem.tail.strip():
+            texts.append(elem.tail.strip())
+
+    # Объединяем мелкие фрагменты в абзацы
+    paragraphs = []
+    current = []
+    for t in texts:
+        current.append(t)
+        if len(t) > 80 or t.endswith((".", ":", ";")):
+            merged = " ".join(current)
+            if len(merged) > 5:
+                paragraphs.append(merged)
+            current = []
+    if current:
+        merged = " ".join(current)
+        if len(merged) > 5:
+            paragraphs.append(merged)
 
     return paragraphs
 

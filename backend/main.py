@@ -11,7 +11,7 @@ import shutil
 import uuid
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -22,12 +22,13 @@ from builders.agreement_builder import build_agreement_docx
 from builders.compliance_report_builder import build_compliance_report
 from builders.diff_report_builder import build_diff_report
 from compliance.compliance_checker import check_compliance
-from compliance.document_store import VALID_DOC_TYPES, get_regulatory_summary, upload_regulatory_doc
+from compliance.document_store import VALID_DOC_TYPES, get_regulatory_summary, get_total_tokens, upload_regulatory_doc
 from integrations.egrul import find_by_inn_or_ogrn, get_persons_recursive, search_by_name
 from integrations.interest_detector import detect_interest
 from normalizers.pptx_normalizer import normalize_pptx
 from parsers.docx_diff import compare_documents
 from parsers.docx_track_changes import extract_track_changes, filter_significant_changes
+from parsers.contract_metadata import extract_metadata
 
 load_dotenv()
 
@@ -94,11 +95,11 @@ async def health():
 @app.post("/generate/supplement")
 async def generate_supplement_endpoint(
     file: UploadFile = File(...),
-    contract_name: str = "Договор",
-    contract_number: str = "",
-    contract_date: str = "",
-    party_1: str = "Сторона 1",
-    party_2: str = "Сторона 2",
+    contract_name: str = Form("Договор"),
+    contract_number: str = Form(""),
+    contract_date: str = Form(""),
+    party_1: str = Form("Сторона 1"),
+    party_2: str = Form("Сторона 2"),
 ):
     """
     Загрузи DOCX с Track Changes → получи допсоглашение.
@@ -156,6 +157,27 @@ async def generate_supplement_endpoint(
     )
 
 
+@app.post("/extract/contract-metadata")
+async def extract_contract_metadata(file: UploadFile = File(...)):
+    """
+    Извлекает метаданные договора (название, номер, дата, стороны).
+    Все поля опциональны.
+    """
+    if not (file.filename or "").endswith(".docx"):
+        raise HTTPException(400, "Только .docx файлы")
+
+    job_id = str(uuid.uuid4())[:8]
+    temp_path = os.path.join(UPLOAD_DIR, f"{job_id}_meta.docx")
+
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    try:
+        return extract_metadata(temp_path)
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка извлечения: {str(e)}")
+
+
 @app.post("/compare/docx")
 async def compare_documents_endpoint(
     file_a: UploadFile = File(...),
@@ -211,20 +233,21 @@ async def compare_documents_endpoint(
 @app.post("/compliance/upload-regulatory")
 async def upload_regulatory_endpoint(
     file: UploadFile = File(...),
-    doc_type: str = "fz_208",
-    doc_name: str = "Документ",
+    doc_type: str = Form("fz_208"),
+    doc_name: str = Form("Документ"),
 ):
     """
     Загрузить нормативный документ (ФЗ, Устав или Корп. договор).
     doc_type: federal_law | charter | corporate_agreement
     """
-    if not (file.filename or "").endswith(".docx"):
-        raise HTTPException(400, "Только .docx файлы")
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in (".docx", ".odt"):
+        raise HTTPException(400, "Поддерживаются .docx и .odt файлы")
     if doc_type not in VALID_DOC_TYPES:
         raise HTTPException(400, f"doc_type: {', '.join(VALID_DOC_TYPES)}")
 
     job_id = str(uuid.uuid4())[:8]
-    temp_path = os.path.join(UPLOAD_DIR, f"{job_id}_{doc_type}.docx")
+    temp_path = os.path.join(UPLOAD_DIR, f"{job_id}_{doc_type}{ext}")
 
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -240,7 +263,10 @@ async def upload_regulatory_endpoint(
 @app.get("/compliance/regulatory-docs")
 async def list_regulatory_docs():
     """Список загруженных нормативных документов."""
-    return get_regulatory_summary()
+    return {
+        "documents": get_regulatory_summary(),
+        "token_budget": get_total_tokens(),
+    }
 
 
 @app.post("/compliance/check")
