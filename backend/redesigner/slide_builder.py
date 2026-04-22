@@ -48,6 +48,57 @@ def _copy_shape_xml(src_shape, target_slide):
     return new_elem
 
 
+def _clone_slide_with_rels(src_slide, target_prs, blank_layout):
+    """
+    Клонировать слайд целиком (shapes + media + rels) из source_prs в target_prs.
+    Используется для _original — когда нужно сохранить слайд как есть.
+    """
+    target_slide = target_prs.slides.add_slide(blank_layout)
+
+    # Background
+    try:
+        _copy_background(src_slide, target_slide)
+    except Exception:
+        pass
+
+    # Копируем shapes и переносим связанные media (picture rels)
+    src_part = src_slide.part
+    target_part = target_slide.part
+
+    # Map: old_rId -> new_rId
+    rid_map = {}
+
+    for shape in src_slide.shapes:
+        src_elem = shape._element
+        new_elem = copy.deepcopy(src_elem)
+
+        # Найти все ссылки вида r:embed, r:link внутри скопированного элемента
+        for attr_name in ("r:embed", "r:link"):
+            # lxml ищет по qn()
+            for elem in new_elem.iter():
+                for a_key, a_val in list(elem.attrib.items()):
+                    if a_key.endswith("}embed") or a_key.endswith("}link"):
+                        old_rid = a_val
+                        if old_rid in rid_map:
+                            elem.set(a_key, rid_map[old_rid])
+                            continue
+                        # Взять target этого rel в source part
+                        try:
+                            related = src_part.related_part(old_rid)
+                        except KeyError:
+                            continue
+                        # Добавить такое же media в target part
+                        new_rid = target_part.relate_to(
+                            related, src_part.rels[old_rid].reltype
+                        )
+                        rid_map[old_rid] = new_rid
+                        elem.set(a_key, new_rid)
+
+        target_slide.shapes._spTree.append(new_elem)
+
+    return target_slide
+
+
 def _copy_background(src_slide, target_slide):
     """Копировать background."""
     src_bg = src_slide.background._element
@@ -201,14 +252,10 @@ def build_presentation(
         content = spec.get("content", {})
         
         if kind == "_original":
-            # Скопировать слайд из исходной презы как есть
             if source_prs and "source_slide_idx" in spec:
                 src_slide = source_prs.slides[spec["source_slide_idx"]]
-                target_slide = output_prs.slides.add_slide(blank_layout)
-                # Копируем background и все shapes
-                _copy_background(src_slide, target_slide)
-                for shape in src_slide.shapes:
-                    _copy_shape_xml(shape, target_slide)
+                # Правильное клонирование: копируем slide через XML и rels
+                _clone_slide_with_rels(src_slide, output_prs, blank_layout)
             continue
         
         if kind not in LAYOUT_KINDS:

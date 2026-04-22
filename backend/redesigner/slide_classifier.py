@@ -195,7 +195,14 @@ def classify_slide(slide_info: dict, anthropic_client: Anthropic,
                 returned = s.get("content", {}).get("TITLE", "").strip()
                 if returned and input_title_norm and returned.lower() not in input_title_norm.lower():
                     # Claude выдумал — подменяем на исходный title
-                    s["content"]["TITLE"] = input_title_norm[:30]  # respect limit
+                    # Обрезать до 30 символов, но не посреди слова
+                    MAX_TITLE = 30
+                    if len(input_title_norm) <= MAX_TITLE:
+                        s["content"]["TITLE"] = input_title_norm
+                    else:
+                        # последний пробел до лимита
+                        cut = input_title_norm[:MAX_TITLE].rsplit(" ", 1)[0]
+                        s["content"]["TITLE"] = cut if cut else input_title_norm[:MAX_TITLE]
                     if "reasoning" in result:
                         result["reasoning"] += " [TITLE forced to input]"
 
