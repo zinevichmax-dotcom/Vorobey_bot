@@ -29,6 +29,7 @@ from normalizers.pptx_normalizer import normalize_pptx
 from parsers.docx_diff import compare_documents
 from parsers.docx_track_changes import extract_track_changes, filter_significant_changes
 from parsers.contract_metadata import extract_metadata
+from redesigner import redesign
 
 load_dotenv()
 
@@ -90,6 +91,74 @@ async def normalize_pptx_endpoint(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/redesign/pptx")
+async def redesign_pptx(
+    file: UploadFile = File(...),
+    style: str = Form(...),
+):
+    """Редизайн PPTX в один из 3 стилей."""
+    if style not in ("formal", "corporate", "bold"):
+        raise HTTPException(400, "Invalid style. Use: formal, corporate, bold")
+
+    if not (file.filename or "").lower().endswith(".pptx"):
+        raise HTTPException(400, "Only .pptx files supported")
+
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="redesign_")
+    input_path = os.path.join(tmpdir, file.filename)
+    with open(input_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    output_path = os.path.join(tmpdir, f"redesigned_{style}.pptx")
+
+    result = redesign(
+        input_pptx_path=input_path,
+        style=style,
+        output_pptx_path=output_path,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(500, result.get("error", "Unknown error"))
+
+    return FileResponse(
+        output_path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=f"redesigned_{style}_{file.filename}",
+    )
+
+
+@app.get("/redesign/styles")
+async def get_redesign_styles():
+    """Список стилей для UI (карточки выбора)."""
+    return {
+        "styles": [
+            {
+                "id": "formal",
+                "name": "Формальный",
+                "description": "Классика. Для судов, меморандумов.",
+                "colors": ["#253278", "#F8EFE5"],
+                "font": "Inter",
+            },
+            {
+                "id": "corporate",
+                "name": "Корпоративный",
+                "description": "Чистый с градиентами. Для клиентов.",
+                "colors": ["#24629A", "#E8A46B"],
+                "font": "Lato + Source Serif",
+            },
+            {
+                "id": "bold",
+                "name": "Современный",
+                "description": "Тёмный контраст. Для питчей.",
+                "colors": ["#000000", "#2D8FCF"],
+                "font": "Kollektif",
+            },
+        ]
+    }
 
 
 @app.post("/generate/supplement")
