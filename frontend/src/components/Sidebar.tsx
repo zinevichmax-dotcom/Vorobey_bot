@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils"
 import {
   Home,
   Wand2,
+  Palette,
   FileText,
   GitCompare,
   ShieldCheck,
@@ -17,6 +18,7 @@ import {
 const modules = [
   { href: "/", label: "Главная", icon: Home },
   { href: "/normalize", label: "Нормализация PPTX", icon: Wand2 },
+  { href: "/redesign", label: "Редизайн PPTX", icon: Palette },
   { href: "/supplement", label: "Допсоглашение", icon: FileText },
   { href: "/compare", label: "Сравнение документов", icon: GitCompare },
   { href: "/compliance", label: "Compliance проверка", icon: ShieldCheck },
